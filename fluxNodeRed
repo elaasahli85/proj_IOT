@@ -1,0 +1,118 @@
+gestion switch:
+// Récupérer l'état mémorisé
+let systemEnabled = context.get("systemEnabled") ?? false;
+// Convertir les valeurs du Dashboard en booléen
+function toBoolean(value) {
+if (value === true || value === 1) return true;
+if (typeof value === "string") {
+const v = value.toLowerCase().trim();
+return v === "true" || v === "1" || v === "on";
+}
+return false;
+}
+// Message provenant du switch Dashboard
+if (msg.topic === "dashboard_switch") {
+systemEnabled = toBoolean(msg.payload);
+}
+// Message provenant du bouton physique Arduino
+else if (msg.topic === "arduino/ecg/button") {
+systemEnabled = !systemEnabled;
+}
+// Ignorer les autres messages
+else {
+return null;
+}
+// Mémoriser l'état
+context.set("systemEnabled", systemEnabled);
+// Sortie 1 : mise à jour de l'affichage Dashboard
+const dashboardMsg = {
+topic: "dashboard_switch",
+payload: systemEnabled
+};
+// Sortie 2 : transmettre le nouvel état
+const logicMsg = {
+topic: "system_state",
+payload: systemEnabled
+};
+node.warn(
+"Gestion switch : " +
+(systemEnabled ? "ON" : "OFF")
+);
+// Sortie 1 vers Dashboard, sortie 2 vers Function 3
+return [dashboardMsg, logicMsg];
+fonction etat systeme:
+if (msg.topic !== "system_state") {
+node.warn("Function 3 : topic inattendu = " + msg.topic);
+return null;
+}
+const systemEnabled =
+msg.payload === true ||
+msg.payload === 1 ||
+msg.payload === "true" ||
+msg.payload === "on";
+flow.set("systemEnabled", systemEnabled);
+node.warn(
+"Function 3 : état enregistré = " +
+(flow.get("systemEnabled") ? "ON" : "OFF")
+);
+return {
+topic: "system_state",
+payload: systemEnabled
+};
+fonction alarme:
+// Récupérer l'état partagé depuis Function 3
+let systemEnabled = flow.get("systemEnabled") ?? false;
+// Récupérer le dernier BPM mémorisé
+let bpm = context.get("bpm") ?? 0;
+// Si le message vient de Function 3
+if (msg.topic === "system_state") {
+// Lire l'état enregistré par Function 3
+systemEnabled = flow.get("systemEnabled") ?? false;
+}
+// Si le message contient un nouveau BPM
+else if (msg.topic === "arduino/ecg/bpm") {
+bpm = Number(msg.payload);
+if (!Number.isFinite(bpm)) {
+return null;
+}
+// Mémoriser le dernier BPM
+context.set("bpm", bpm);
+}
+// Ignorer les autres messages
+else {
+return null;
+}
+// Calculer si l'alarme doit être activée
+const alarm =
+systemEnabled &&
+bpm > 0 &&
+(bpm < 50 || bpm > 120);
+// Afficher les informations dans le Debug
+node.warn(
+"État : " + (systemEnabled ? "ON" : "OFF") +
+" | BPM : " + bpm +
+" | Alarme : " + (alarm ? "ON" : "OFF")
+);
+// Envoyer la commande à Arduino via MQTT
+msg.topic = "arduino/ecg/alarm_enable";
+msg.payload = alarm ? "ON" : "OFF";
+return msg;
+fonction led:
+// Convertir le BPM reçu en nombre
+const bpm = Number(msg.payload);
+// Ignorer les valeurs invalides
+if (!Number.isFinite(bpm) || bpm <= 0) {
+return null;
+}
+// Sortie 1 : message pour le graphique
+const chartMsg = {
+payload: bpm,
+topic: "BPM"
+};
+// Sortie 2 : message pour la LED Arduino
+const ledMsg = {
+topic: "arduino/ecg/led_bpm",
+payload: String(bpm)
+};
+// Envoyer les deux messages
+return [chartMsg, ledMsg];
