@@ -1,0 +1,382 @@
+#include <WiFiS3.h>
+#include <PubSubClient.h>
+// =====================================================
+// 1. CONFIGURATION WIFI
+// =====================================================
+const char *ssid = "Infinix HOT 40 Pro";
+const char *password = "snoopy123";
+// =====================================================
+// 2. CONFIGURATION MQTT
+// =====================================================
+const char* MQTT_SERVER = "broker.emqx.io [http://broker.emqx.io/]";
+const int MQTT_PORT = 1883;
+// Utiliser un identifiant unique sur le broker public
+const char* MQTT_CLIENT_ID = "ECG_Arduino_User_2026_X7";
+// Topics MQTT
+const char* TOPIC_BPM =
+"arduino/ecg/bpm";
+const char* TOPIC_LED_BPM =
+"arduino/ecg/led_bpm";
+const char* TOPIC_ALARM =
+"arduino/ecg/alarm_enable";
+const char* TOPIC_STATUS =
+"arduino/ecg/status";
+const char* TOPIC_BUTTON =
+"arduino/ecg/button";
+// =====================================================
+// 3. BROCHES
+// =====================================================
+const int ECG_PIN = A0;
+const int LO_PLUS_PIN = 10;
+const int LO_MINUS_PIN = 11;
+const int LED_PIN = 8;
+const int BUZZER_PIN = 6;
+const int BUTTON_PIN = 7;
+// =====================================================
+// 4. OBJETS WIFI ET MQTT
+// =====================================================
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+// =====================================================
+// 5. VARIABLES BPM
+// =====================================================
+int currentBPM = 0;
+int ledBPM = 0;
+bool aboveThreshold = false;
+unsigned long lastBeatTime = 0;
+unsigned long lastValidBeatTime = 0;
+unsigned long lastBpmPublishTime = 0;
+const int ECG_THRESHOLD_HIGH = 550;
+const int ECG_THRESHOLD_LOW = 500;
+const unsigned long MIN_BEAT_INTERVAL = 400;
+const unsigned long MAX_BEAT_INTERVAL = 2000;
+const unsigned long BPM_PUBLISH_INTERVAL = 1000;
+// =====================================================
+// 6. VARIABLES LED
+// =====================================================
+bool ledState = false;
+unsigned long ledTimer = 0;
+const unsigned long LED_ON_TIME = 100;
+// =====================================================
+// 7. VARIABLES BUZZER
+// =====================================================
+bool buzzerEnabled = false;
+bool beepActive = false;
+unsigned long lastBeepTime = 0;
+const unsigned long BEEP_INTERVAL = 1000;
+const unsigned long BEEP_DURATION = 150;
+const unsigned int BEEP_FREQUENCY = 1000;
+// =====================================================
+// 8. VARIABLES BOUTON
+// =====================================================
+// INPUT_PULLUP :
+// HIGH = bouton relâché
+// LOW = bouton appuyé
+int lastButtonReading = HIGH;
+int stableButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long DEBOUNCE_DELAY = 50;
+// =====================================================
+// 9. CONNEXION WIFI
+// =====================================================
+void connectWiFi() {
+Serial.print("Connexion au WiFi...");
+WiFi.begin(ssid, password);
+while (WiFi.status() != WL_CONNECTED) {
+delay(500);
+Serial.print(".");
+}
+Serial.println();
+Serial.println("WiFi connecte !");
+Serial.print("Adresse IP : ");
+Serial.println(WiFi.localIP());
+}
+// =====================================================
+// 10. CALLBACK MQTT
+// Réception des commandes de Node-RED
+// =====================================================
+void mqttCallback(char* topic, byte* payload,
+unsigned int length) {
+String receivedTopic = String(topic);
+String message = "";
+for (unsigned int i = 0; i < length; i++) {
+message += (char)payload[i];
+}
+message.trim();
+// Afficher tous les messages MQTT reçus
+Serial.print("MQTT topic recu : ");
+Serial.println(receivedTopic);
+Serial.print("MQTT payload recu : [");
+Serial.print(message);
+Serial.println("]");
+// ---------------------------------------------------
+// A. BPM reçu de Node-RED pour la LED
+// ---------------------------------------------------
+if (receivedTopic == TOPIC_LED_BPM) {
+int receivedBPM = message.toInt();
+if (receivedBPM >= 30 && receivedBPM <= 200) {
+ledBPM = receivedBPM;
+ledState = false;
+digitalWrite(LED_PIN, LOW);
+ledTimer = millis();
+Serial.print("BPM pour LED : ");
+Serial.println(ledBPM);
+}
+else if (receivedBPM == 0) {
+ledBPM = 0;
+ledState = false;
+digitalWrite(LED_PIN, LOW);
+Serial.println("BPM nul : LED eteinte");
+}
+}
+// ---------------------------------------------------
+// B. COMMANDE DU BUZZER DEPUIS NODE-RED
+// ---------------------------------------------------
+else if (receivedTopic == TOPIC_ALARM) {
+message.toUpperCase();
+if (message == "ON") {
+buzzerEnabled = true;
+Serial.println("Commande buzzer recue : ON");
+// Le prochain bip peut commencer immédiatement
+lastBeepTime = millis() - BEEP_INTERVAL;
+}
+else if (message == "OFF") {
+buzzerEnabled = false;
+noTone(BUZZER_PIN);
+digitalWrite(BUZZER_PIN, LOW);
+beepActive = false;
+Serial.println("Commande buzzer recue : OFF");
+}
+else {
+Serial.print("Commande buzzer inconnue : ");
+Serial.println(message);
+}
+}
+}
+// =====================================================
+// 11. CONNEXION MQTT
+// =====================================================
+void reconnectMQTT() {
+while (!mqtt.connected()) {
+Serial.print("Connexion MQTT...");
+if (mqtt.connect(MQTT_CLIENT_ID)) {
+Serial.println("Connecte !");
+// S'abonner aux commandes venant de Node-RED
+bool ledSubscribed = mqtt.subscribe(TOPIC_LED_BPM);
+bool alarmSubscribed = mqtt.subscribe(TOPIC_ALARM);
+Serial.print("Abonnement LED : ");
+Serial.println(ledSubscribed ? "OK" : "ECHEC");
+Serial.print("Abonnement buzzer : ");
+Serial.println(alarmSubscribed ? "OK" : "ECHEC");
+mqtt.publish(TOPIC_STATUS, "ONLINE");
+} else {
+Serial.print("Echec MQTT, code : ");
+Serial.println(mqtt.state());
+delay(2000);
+}
+}
+}
+// =====================================================
+// 12. LECTURE DU BOUTON PHYSIQUE
+// =====================================================
+void updateButton() {
+int reading = digitalRead(BUTTON_PIN);
+unsigned long now = millis();
+if (reading != lastButtonReading) {
+lastDebounceTime = now;
+}
+if (now - lastDebounceTime >= DEBOUNCE_DELAY) {
+if (reading != stableButtonState) {
+stableButtonState = reading;
+// Détecter uniquement l'appui
+if (stableButtonState == LOW) {
+Serial.println("Bouton appuye !");
+if (mqtt.connected()) {
+bool sent = mqtt.publish(
+TOPIC_BUTTON,
+"PRESS"
+);
+Serial.println(
+sent
+? "Evenement bouton envoye"
+: "Echec envoi bouton"
+);
+} else {
+Serial.println("MQTT deconnecte : bouton non envoye");
+}
+}
+}
+}
+lastButtonReading = reading;
+}
+// =====================================================
+// 13. LECTURE ECG ET CALCUL DU BPM
+// =====================================================
+void updateECG() {
+unsigned long now = millis();
+// Vérifier les électrodes
+if (digitalRead(LO_PLUS_PIN) == HIGH ||
+digitalRead(LO_MINUS_PIN) == HIGH) {
+currentBPM = 0;
+aboveThreshold = false;
+lastBeatTime = 0;
+lastValidBeatTime = 0;
+}
+else {
+int ecgValue = analogRead(ECG_PIN);
+// Détection du franchissement du seuil haut
+if (!aboveThreshold &&
+ecgValue > ECG_THRESHOLD_HIGH) {
+aboveThreshold = true;
+if (lastBeatTime == 0) {
+lastBeatTime = now;
+}
+else {
+unsigned long interval = now - lastBeatTime;
+if (interval >= MIN_BEAT_INTERVAL &&
+interval <= MAX_BEAT_INTERVAL) {
+int calculatedBPM = 60000UL / interval;
+if (calculatedBPM >= 30 &&
+calculatedBPM <= 150) {
+currentBPM = calculatedBPM;
+lastValidBeatTime = now;
+Serial.print("BPM = ");
+Serial.println(currentBPM);
+}
+}
+lastBeatTime = now;
+}
+}
+// Réarmer la détection
+if (ecgValue < ECG_THRESHOLD_LOW) {
+aboveThreshold = false;
+}
+// Effacer un BPM devenu trop ancien
+if (lastValidBeatTime > 0 &&
+now - lastValidBeatTime > 3000) {
+currentBPM = 0;
+}
+}
+// Publier le BPM toutes les secondes
+if (now - lastBpmPublishTime >=
+BPM_PUBLISH_INTERVAL) {
+if (mqtt.connected()) {
+char bpmMessage[10];
+snprintf(
+bpmMessage,
+sizeof(bpmMessage),
+"%d",
+currentBPM
+);
+bool sent = mqtt.publish(
+TOPIC_BPM,
+bpmMessage
+);
+if (!sent) {
+Serial.println("Echec publication BPM");
+}
+lastBpmPublishTime = now;
+}
+}
+}
+// =====================================================
+// 14. CLIGNOTEMENT DE LA LED SELON LE BPM
+// =====================================================
+void updateLED() {
+unsigned long now = millis();
+if (ledBPM <= 0) {
+digitalWrite(LED_PIN, LOW);
+ledState = false;
+return;
+}
+unsigned long beatPeriod = 60000UL / ledBPM;
+unsigned long onDuration = LED_ON_TIME;
+if (onDuration >= beatPeriod) {
+onDuration = beatPeriod / 2;
+}
+if (!ledState) {
+if (now - ledTimer >= beatPeriod) {
+ledState = true;
+ledTimer = now;
+digitalWrite(LED_PIN, HIGH);
+}
+}
+else {
+if (now - ledTimer >= onDuration) {
+ledState = false;
+digitalWrite(LED_PIN, LOW);
+}
+}
+}
+// =====================================================
+// 15. BUZZER
+// La décision d'alarme vient de Node-RED
+// =====================================================
+void updateBuzzer() {
+unsigned long now = millis();
+// Si Node-RED envoie OFF, couper le buzzer
+if (!buzzerEnabled) {
+if (beepActive) {
+noTone(BUZZER_PIN);
+digitalWrite(BUZZER_PIN, LOW);
+beepActive = false;
+}
+return;
+}
+// Démarrer un bip
+if (!beepActive &&
+now - lastBeepTime >= BEEP_INTERVAL) {
+tone(BUZZER_PIN, BEEP_FREQUENCY);
+beepActive = true;
+lastBeepTime = now;
+Serial.println("BIP !");
+}
+// Arrêter le bip après 150 ms
+if (beepActive &&
+now - lastBeepTime >= BEEP_DURATION) {
+noTone(BUZZER_PIN);
+digitalWrite(BUZZER_PIN, LOW);
+beepActive = false;
+}
+}
+// =====================================================
+// 16. SETUP
+// =====================================================
+void setup() {
+Serial.begin(115200);
+pinMode(ECG_PIN, INPUT);
+pinMode(LO_PLUS_PIN, INPUT);
+pinMode(LO_MINUS_PIN, INPUT);
+pinMode(LED_PIN, OUTPUT);
+pinMode(BUZZER_PIN, OUTPUT);
+// Bouton avec résistance pull-up interne
+pinMode(BUTTON_PIN, INPUT_PULLUP);
+digitalWrite(LED_PIN, LOW);
+digitalWrite(BUZZER_PIN, LOW);
+connectWiFi();
+mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+mqtt.setCallback(mqttCallback);
+mqtt.setKeepAlive(30);
+Serial.println("Systeme ECG pret !");
+}
+// =====================================================
+// 17. LOOP
+// =====================================================
+void loop() {
+if (WiFi.status() != WL_CONNECTED) {
+connectWiFi();
+}
+if (!mqtt.connected()) {
+reconnectMQTT();
+}
+// Traiter les messages MQTT entrants
+mqtt.loop();
+// Lire le bouton physique
+updateButton();
+// Lire le capteur et publier le BPM
+updateECG();
+// Contrôler la LED selon le BPM reçu
+updateLED();
+// Exécuter les commandes du buzzer
+updateBuzzer();
+}
